@@ -1,0 +1,419 @@
+#include <Arduino.h>
+#include <avr/io.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "gpio.h"
+#include "utils.h"
+#include "lcd.h"
+#include "adc.h"
+#include "memory.h"
+#include "keypad.h"
+#include "curvo.h"
+#include "uart.h"
+#include "gsm.h"
+#include "mqtt.h"
+
+#ifndef iotsecureconfig
+#define iotsecureconfig
+#define username "rsanjai"
+#define mailid   "rsanjai772@gmail.com"
+#define password "PIC16f877a"
+#define api      "BBUS-E3F2Kknh2qHTl79E8lJVScLJiwpS6f" 
+#endif
+
+#ifndef lcdpinconfig
+#define lcdpinconfig
+#define rs 13
+#define en 12 
+#define d4 11
+#define d5 10
+#define d6 9
+#define d7 8
+#endif 
+
+#ifndef keypadpinconfig
+#define keypadpinconfig
+#define setkey 7
+#define movkey 6
+#define entkey 5
+#define inckey 4
+#define deckey 3
+#endif 
+
+#ifndef alarmpinconfig
+#define alarmpinconfig
+#define alarm 2
+#endif
+
+#ifndef curvopinconfig
+#define curvopinconfig
+#define currentsensor AN1
+#define voltagesensor AN0
+#endif 
+
+#ifndef relaypinconfig
+#define relaypinconfig
+#define primaryrelay1   AN2
+#define primaryrelay2   AN3
+#define secondaryrelay1 AN4
+#define secondaryrelay2 AN5
+#endif 
+
+#ifndef gsmpinconfig
+#define gsmpinconfig
+#define gsmtransmitter 1
+#define gsmreceiver    0
+#define gsmbaudrate    9600
+#endif 
+
+typedef struct
+{
+  volatile float voltage;
+  volatile float current;
+  volatile unsigned int energy;
+  volatile unsigned int unit;
+  volatile unsigned long price;
+}
+power_struct_variable;
+
+gsm_rtc_variable time;
+power_struct_variable watt{0, 0, 0, 0, 0};
+
+bool isprimaryloadon, issecondaryloadon;
+bool ispowerforcedoff, ispowermanagement;
+volatile bool isupdaterequired, istimeupdaterequired;
+
+unsigned char lastdetectedkey, mqttresult;
+unsigned int mqttreturnvariable, keydebouncetime;
+volatile unsigned int mticks;
+
+unsigned char detectedmonth;
+unsigned char mobilenumber1[12];
+unsigned char mobilenumber2[12];
+unsigned char mobilenumberx[12];
+
+ISR(TIMER2_OVF_vect)
+{
+  if(++mticks > 999)
+  {
+    mticks = 0;
+    watt.energy += (unsigned int)(watt.voltage * watt.current);
+
+    if(++time.seconds > 59)
+    {
+      time.seconds = 0;
+      istimeupdaterequired = true;
+
+      if(time.minute > 59) time.minute = 59;
+      if(time.hour > 23) time.hour = 23;
+    }
+
+    if(watt.energy > 1000)
+    {
+      watt.energy -= 1000;
+      watt.unit++;
+      watt.price += 5;
+      isupdaterequired = true;
+    }
+  }
+  TCNT2 = 5;
+}
+
+void setup()
+{
+  gpio_set_output(alarm);
+  gpio_put_low(alarm);
+  
+  gpio_set_output(primaryrelay1);
+  gpio_set_output(primaryrelay2);
+  gpio_put_high(primaryrelay1);
+  gpio_put_high(primaryrelay2);
+
+  gpio_set_output(secondaryrelay1);
+  gpio_set_output(secondaryrelay2);
+  gpio_put_high(secondaryrelay1);
+  gpio_put_high(secondaryrelay2);
+
+  lcd_initialize(rs, en, d4, d5, d6, d7);
+  lcd_disp(0x80," SMART EB METER ");
+  lcd_disp(0xC0,"E-VEHICLE CHARGE");
+  delay_ms(2500); lcd_function(clear_display);
+
+  adc_initialize();
+  keypad_initialize(setkey, movkey, entkey, inckey, deckey);
+  curvo_initialize(currentsensor, acs712_5a);
+  curvo_initialize(voltagesensor, zmpt101_5ma);
+
+  if(gsm_initialize(gsmbaudrate)) lcd_disp(0x80,"GSM FOUND");
+  else lcd_disp(0x80,"GSM NOT FOUND"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(gsm_sim_status()) lcd_disp(0x80,"SIM FOUND");
+  else lcd_disp(0x80,"SIM NOT FOUND"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(gsm_tower_wait()) lcd_disp(0x80,"SIM TOWERED");
+  else lcd_disp(0x80,"SIM TOWER ERR"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(gsm_msg_enable(true)) lcd_disp(0x80,"MSG READY");
+  else lcd_disp(0x80,"MSG ERROR"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(gsm_sim_terminal()) lcd_disp(0x80,"TERMINAL READY");
+  else lcd_disp(0x80,"TERMINAL ERR"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(gsm_gprs_enable(true)) lcd_disp(0x80,"GPRS ENABLED");
+  else lcd_disp(0x80,"GPRS ERROR"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(gsm_location_enable(true)) lcd_disp(0x80,"APN READY");
+  else lcd_disp(0x80,"APN ERROR"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(gsm_gprs_start(mqttserver, mqttport)) lcd_disp(0x80,"SERVER CONNECT");
+  else lcd_disp(0x80,"SERVER ERROR"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(mqtt_connect()) lcd_disp(0x80,"MQTT ESTABLISHED");
+  else lcd_disp(0x80,"MQTT ERROR"); delay_ms(500);
+  lcd_function(clear_display);
+
+  if(mqtt_publish(variablelabel1, true)) lcd_disp(0x80,"PRIMARY UPDATED");
+  else lcd_disp(0x80,"PRIM UPDATE ERR"); delay_ms(500);
+  lcd_function(clear_display); serial_flush();
+
+  if(mqtt_publish(variablelabel2, true)) lcd_disp(0x80,"SECONDARY UPDATE");
+  else lcd_disp(0x80,"SEC UPDATE ERR"); delay_ms(500);
+  lcd_function(clear_display); serial_flush();
+
+  if(mqtt_subscribe(variablelabel3, 1)) lcd_disp(0x80,"PRIM SUBSCRIBED");
+  else lcd_disp(0x80,"PRIM SUB ERR"); delay_ms(500);
+  lcd_function(clear_display); serial_flush();
+
+  if(mqtt_subscribe(variablelabel4, 2)) lcd_disp(0x80,"SEC SUBSCRIBED");
+  else lcd_disp(0x80,"SEC SUB ERR"); delay_ms(500);
+  lcd_function(clear_display); serial_flush();
+
+  gsm_time_read(&time);
+  detectedmonth = time.month;
+  serial_flush();
+
+  memory_read_sequence(0x10, (void*)mobilenumber1, sizeof(char), 10);
+  memory_read_sequence(0x20, (void*)mobilenumber2, sizeof(char), 10);
+  if(mobilenumber1[0] == 0xFF) memcpy(mobilenumber1, "9944009536", 10);
+  if(mobilenumber2[0] == 0xFF) memcpy(mobilenumber2, "9944009536", 10);
+
+  gpio_put_low(primaryrelay1);
+  gpio_put_low(primaryrelay2);
+  isprimaryloadon = true;
+
+  gpio_put_low(secondaryrelay1);
+  gpio_put_low(secondaryrelay2);
+  issecondaryloadon = true;
+
+  TCCR2A = 0x00;
+  TCCR2B = 0x04;
+  ASSR = 0x00;
+  TCNT2 = 5;
+  TIMSK2 = (1 << 0);
+}
+
+void loop()
+{
+  watt.current = curvo_current_ac();
+  watt.voltage = curvo_voltage_ac();
+  lastdetectedkey = keypad_fetch(&keydebouncetime);
+
+  lcd_decimal(0x80, time.hour, 2, DEC);
+  lcd_write(0x82, ':');
+  lcd_decimal(0x83, time.minute, 2, DEC);
+
+  lcd_decimal(0x86, time.date, 2, DEC);
+  lcd_write(0x88, '/');
+  lcd_decimal(0x89, time.month, 2, DEC);
+  lcd_write(0x8B, '/');
+  lcd_decimal(0x8C, time.year, 2, DEC);
+
+  lcd_disp(0xC0,"V:");
+  lcd_decimal(0xC2, (unsigned int)watt.voltage, 3, DEC);
+  lcd_disp(0xC6, "I:");
+  lcd_float(0xC8, watt.current, 2, 2);
+
+  if(!ispowerforcedoff && isprimaryloadon)
+  {
+    gpio_put_low(primaryrelay1);
+    gpio_put_low(primaryrelay2);
+  }
+  else
+  {
+    gpio_put_high(primaryrelay1);
+    gpio_put_high(primaryrelay2);
+  }
+
+  if(!ispowerforcedoff && issecondaryloadon)
+  {
+    gpio_put_low(secondaryrelay1);
+    gpio_put_low(secondaryrelay2);
+  }
+  else
+  {
+    gpio_put_high(secondaryrelay1);
+    gpio_put_high(secondaryrelay2);
+  }
+
+  if(isupdaterequired || lastdetectedkey == ent)
+  {
+    isupdaterequired = false;
+    memory_write_data(0x00, &watt.unit, sizeof(int));
+    mqtt_publish(variablelabel1, isprimaryloadon);
+    mqtt_publish(variablelabel2, issecondaryloadon);
+    mqtt_publish(variablelabel5, (unsigned)(watt.current * 100)); 
+    mqtt_publish(variablelabel6, (unsigned)watt.voltage);
+    mqtt_publish(variablelabel7, watt.energy);
+    mqtt_publish(variablelabel8, watt.unit);
+    mqtt_publish(variablelabel9, watt.price);
+    serial_flush(); gsm_time_read(&time);
+  }
+  else if(istimeupdaterequired)
+  {
+    gsm_time_read(&time); 
+    serial_flush();
+    istimeupdaterequired = false;
+  }
+
+  if(lastdetectedkey == set && keydebouncetime > 300)
+  {
+    lcd_function(clear_display);
+    lcd_disp(0x80,"ENTER DATE/TIME ");
+    memset(mobilenumberx, '\0', sizeof(mobilenumberx));
+    keypad_rtc(mobilenumberx);
+    time.hour = mobilenumberx[0];
+    time.minute = mobilenumberx[1];
+    time.date = mobilenumberx[2];
+    time.month = mobilenumberx[3];
+    time.year = mobilenumberx[4];
+    time.seconds = 0;
+    gsm_time_write(&time); gsm_time_read(&time);
+    lcd_function(clear_display);
+  }
+  else if(lastdetectedkey == mov && keydebouncetime < 300)
+  {
+    lcd_function(clear_display);
+    lcd_disp(0x80,"USER:");
+    lcd_disp(0xC0,"  EB:");
+    lcd_disp(0x85, (char*)mobilenumber1);
+    lcd_disp(0xC5, (char*)mobilenumber2);
+    while(keypad_fetch(&keydebouncetime) != mov);
+    lcd_function(clear_display);
+  }
+  else if(lastdetectedkey == mov && keydebouncetime > 300)
+  {
+    lcd_function(clear_display);
+    lcd_disp(0x80,"USER:");
+    memset(mobilenumber1, '\0', sizeof(mobilenumber1));
+    keypad_array(0x85, mobilenumber1, 10);
+    memory_write_sequence(0x10, (void*)mobilenumber1, sizeof(char), 10);
+
+    lcd_disp(0xC0,"  EB:");
+    memset(mobilenumber2, '\0', sizeof(mobilenumber2));
+    keypad_array(0xC5, mobilenumber2, 10);
+    memory_write_sequence(0x20, (void*)mobilenumber2, sizeof(char), 10);
+    lcd_function(clear_display);
+  }
+
+  if(mqtt_receive(variablelabel3, &mqttreturnvariable))
+  {
+    if(!ispowerforcedoff && mqttreturnvariable) isprimaryloadon = true;
+    else isprimaryloadon = false;
+    mqtt_publish(variablelabel1, isprimaryloadon); 
+    serial_flush();
+  }
+  else if(mqtt_receive(variablelabel4, &mqttreturnvariable))
+  {
+    if(!ispowerforcedoff && !ispowermanagement && mqttreturnvariable) issecondaryloadon = true;
+    else issecondaryloadon = false;
+    mqtt_publish(variablelabel2, issecondaryloadon);
+    serial_flush();
+  }
+
+  if(time.month && (detectedmonth != time.month))
+  {
+    detectedmonth = time.month;
+    serial_flush(); gpio_put_high(alarm);
+    gsm_msg_start(mobilenumber2);
+    serial_write("EB meter ID:245CH7 unit details");
+    serial_write("\r\nunit:"); serial_decimal(watt.unit, 3, DEC); 
+    serial_write("\r\nprice:"); serial_decimal(watt.price, 4, DEC);
+    serial_write("INR\r\n"); gsm_msg_end();
+    gpio_put_low(alarm); serial_flush();
+  }
+
+  if(gsm_msg_receive(mobilenumberx))
+  {
+    if((strncmp((char*)mobilenumber1, mobilenumberx, 10) == 0 ||
+    strncmp((char*)mobilenumber2, mobilenumberx, 10) == 0) && 
+    strstr((char*)serialarray, "STATUS") != '\0')
+    {
+      serial_flush(); gsm_msg_start(mobilenumberx);
+      serial_write("Meter power status"); 
+      serial_write("\r\nvoltage:"); serial_decimal((unsigned)watt.voltage, 3, DEC);
+      serial_write("\r\ncurrent:"); serial_float(watt.current, 2, 2); 
+      serial_write("\r\nunit:"); serial_decimal(watt.unit, 3, DEC);
+      serial_write("\r\nprice:"); serial_decimal(watt.price, 4, DEC);
+      serial_write("INR\r\n"); gsm_msg_end(); serial_flush();
+    }
+
+    else if(strncmp((char*)mobilenumber2, mobilenumberx, 10) == 0)
+    {
+      if(strstr((char*)serialarray, "RESET") != '\0')
+      {
+        serial_flush(); gpio_put_high(alarm);
+        gsm_msg_send(mobilenumber1, "We've received your EB bill unit resetted...\r\n");
+        gpio_put_low(alarm); serial_flush();
+        watt.unit = 0; watt.price = 0; ispowermanagement = false;
+        isprimaryloadon = issecondaryloadon = true;
+        ispowerforcedoff = false;
+      }
+      else if(strstr((char*)serialarray, "BILLING") != '\0')
+      {
+        serial_flush(); gpio_put_high(alarm);
+        gsm_msg_start(mobilenumber1);
+        serial_write("Acknowledgement from TNEB about billing...");
+        serial_write("\r\nunit:"); serial_decimal(watt.unit, 3, DEC);
+        serial_write("\r\nprice:"); serial_decimal(watt.price, 4, DEC);
+        serial_write("INR\r\n"); gsm_msg_end(); 
+        serial_flush(); gpio_put_low(alarm);
+      }
+      else if(strstr((char*)serialarray, "CUTOFF") != '\0')
+      {
+        serial_flush(); gpio_put_high(alarm);
+        gsm_msg_send(mobilenumber1, "EB bill due limit exceed power forced cutoff...\r\n");
+        gpio_put_low(alarm); serial_flush(); ispowerforcedoff = true;
+        isprimaryloadon = issecondaryloadon = false;
+      }
+      else if(strstr((char*)serialarray, "WARNING") != '\0')
+      {
+        serial_flush(); gpio_put_high(alarm);
+        gsm_msg_send(mobilenumber1, "EB bill due reached warning from TNEB...\r\n");
+        gpio_put_low(alarm); serial_flush();
+      }
+      else if(strstr((char*)serialarray, "MGMNT") != '\0')
+      {
+        serial_flush(); gpio_put_high(alarm); 
+        gsm_msg_send(mobilenumber1, "Due to increased power demand secondary loads were cutoff...\r\n");
+        gpio_put_low(alarm); serial_flush();
+        issecondaryloadon = false; ispowermanagement = true;
+      }
+      else if(strstr((char*)serialarray, "FREE") != '\0')
+      {
+        serial_flush(); gpio_put_high(alarm);
+        gsm_msg_send(mobilenumber1, "Power demand back to normal secondary loads are enabled...\r\n");
+        gpio_put_low(alarm); serial_flush();
+        issecondaryloadon = true; ispowermanagement = false;
+      }
+    }
+  }
+}
